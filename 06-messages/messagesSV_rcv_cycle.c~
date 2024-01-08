@@ -1,0 +1,101 @@
+// Operating Systems: sample code  (c) Tomáš Hudec
+// IPC, Message Queues
+// System V:	msgget(2), msgctl(2), msgsnd(3), msgrcv(3)
+// POSIX:	mq_open(3), mq_receive(2), mq_getattr(3), mq_unlink(3), mq_close(3)
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <string.h>
+#include <errno.h>
+#include <sys/stat.h>	// S_IRUSR, S_IRWXU, …
+#include <sys/wait.h>	// wait(2)
+
+// IPC System V
+#include <sys/types.h>
+#include <sys/ipc.h>
+#include <sys/msg.h>
+
+#include "messagesSV.h"	// defines message size MSG_MAX and message data structure
+
+int mq_id = -1;		// not initialized
+
+// atexit(3) registered
+void remove_q(void)
+{
+	if (-1 != mq_id) {
+		// remove the message queue
+		printf("Removing the message queue (id = %d).\n", mq_id);
+		if (msgctl(mq_id, IPC_RMID, NULL) == -1)
+			perror("msgctl(IPC_RMID) failed");
+		mq_id = -1;
+	}
+}
+
+int main(int argc, char *argv[])
+{
+	int status;
+	struct msgbuf msg_data;
+	struct msqid_ds mq_data;
+	char buffer[MSG_MAX+1];
+	key_t mq_key;		// 32-bit signed int
+	ssize_t msg_size;
+
+	if (argc <= 1) {
+		fprintf(stderr, "Expected the key as the first argument.\n");
+		exit(EXIT_FAILURE);
+	}
+	mq_key = (key_t) strtol(argv[1], NULL, 0);
+
+	// register the deallocation function with atexit(3)
+	atexit(remove_q);
+
+	// get the message queue id
+	mq_id = msgget(mq_key, 0);
+	if (mq_id == -1) {
+		perror("msgget failed");
+		exit(EXIT_FAILURE);
+	}
+
+	// get info about the message queue
+	if (msgctl(mq_id, IPC_STAT, &mq_data) == -1) {
+		perror("msgctl failed");
+		exit(EXIT_FAILURE);
+	}
+	fprintf(stderr, "The number of messages in the queue: %d\n", (int)(mq_data.msg_qnum));
+
+	status = 0;
+	while (status < 2) {
+		// non-blocking receive
+		// message type == 0 -> accept any type
+		// MSG_NOERROR = if the message is longer than given limit
+		// the call does not fail but clips the message instead
+		if ((msg_size = msgrcv(mq_id, (void *) &msg_data, MSG_MAX,
+			0, MSG_NOERROR|IPC_NOWAIT)) == -1) {
+			// error detected
+			switch (errno) {
+			case ENOMSG:	// no more messages in the queue
+				if (status++)
+					fprintf(stderr, "No more messages in the queue.\n");
+				else {
+					fprintf(stderr, "Waiting for more messages.\n");
+					sleep(2);
+				}
+				break;
+			default:	// another error
+				perror("msgrcv failed");
+				exit(EXIT_FAILURE);
+				// break;
+			}
+		}
+		else {
+			// print the received message
+			strncpy(buffer, msg_data.msg_text, msg_size);
+			buffer[msg_size] = '\0';
+			printf("Got the message: %s\n", buffer);
+			status = 0;
+		}
+	}
+
+	exit(EXIT_SUCCESS);
+}

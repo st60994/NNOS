@@ -1,0 +1,92 @@
+// Operating Systems: sample code  (c) Tomáš Hudec
+// IPC, Message Queues
+// msgget(2), msgctl(2), msgsnd(3), msgrcv(3)
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <string.h>
+#include <errno.h>
+#include <sys/stat.h>	// S_IRUSR, S_IRWXU, …
+#include <sys/wait.h>	// wait(2)
+
+// IPC System V
+#include <sys/types.h>
+#include <sys/ipc.h>
+#include <sys/msg.h>
+
+#include "messagesSV.h"	// defines message size MSG_MAX and message data structure
+
+int mq_id = -1;		// not initialized
+
+// atexit(3) registered
+void remove_q(void)
+{
+	if (-1 != mq_id) {
+		// remove the message queue
+		printf("parent: Removing the message queue (id = %d).\n", mq_id);
+		if (msgctl(mq_id, IPC_RMID, NULL) == -1)
+			perror("msgctl(IPC_RMID) failed");
+		mq_id = -1;
+	}
+}
+
+int main(int argc, char *argv[])
+{
+	int child, child_stat;
+	struct msgbuf msg_data;
+	char *buffer;
+	key_t mq_key;		// 32-bit signed int
+	char key_str[21];	// for the string representation of a 64-bit number
+
+	// register the deallocation function with atexit(3)
+	atexit(remove_q);
+
+	// create the (unique) key from the program file and a project number (0--255)
+	mq_key = ftok(argv[0], 61);
+
+	// get the message queue id, create a new queue if it does not exist
+	mq_id = msgget(mq_key, IPC_CREAT | S_IRUSR | S_IWUSR);
+	if (-1 == mq_id) {
+		perror("msgget failed");
+		exit(EXIT_FAILURE);
+	}
+	printf("parent: Created the message queue: key = 0x%x, id = %d\n", mq_key, mq_id);
+
+	if ((child = fork()) == -1) {
+		perror("fork failed");
+		exit(EXIT_FAILURE);
+	}
+
+	if (child == 0) {	// a child executes another program: receive from the queue
+		sprintf(key_str, "0x%x", mq_key);
+		printf("child exec: messagesSV_rcv %s\n", key_str);
+		if (execl("./messagesSV_rcv", "messagesSV_rcv", key_str, NULL) == -1) {
+			perror("execl failed");
+			mq_id = -1;	// do not remove the queue in the child process
+			exit(EXIT_FAILURE);
+		}
+		// not reached
+	}
+
+	// parent process
+
+	if (argc > 1)
+		buffer = argv[1];
+	else
+		buffer = "no news is good news";
+
+	msg_data.msg_type = 1;
+	strncpy(msg_data.msg_text, buffer, MSG_MAX);
+
+	printf("The parent is sending a message: %s\n", buffer);
+	// send the message to the queue
+	if (msgsnd(mq_id, (void *) &msg_data, strlen(buffer), 0) == -1) {
+		perror("msgsnd failed");
+		exit(EXIT_FAILURE);
+	}
+
+	wait(&child_stat);	// wait for the child
+
+	exit(EXIT_SUCCESS);
+}
