@@ -1,0 +1,165 @@
+// Operating Systems: sample code  (c) Tomáš Hudec
+// Threads
+// Critical Sections
+// POSIX mutexes:
+// pthread_mutex_lock(3), pthread_mutex_unlock(3), pthread_mutex_init(3), pthread_mutex_destroy(3)
+// POSIX barriers:
+// pthread_barrier_init(3), pthread_barrier_wait(3), pthread_barrier_destroy(3)
+//
+// Modified: 2015-11-11, 2016-11-14, 2017-04-18, 2021-04-13
+
+// A barrier is a tool that allows the simultaneous execution of threads
+// from the given point.
+
+// we need to define _XOPEN_SOURCE >= 600 for portability (to access barriers)
+// alternatively we can define _POSIX_C_SOURCE:
+
+//#if !defined _POSIX_C_SOURCE || _POSIX_C_SOURCE < 200112L
+//	#define _POSIX_C_SOURCE 200112L	// this also enables barriers
+//#endif
+
+#if !defined _XOPEN_SOURCE || _XOPEN_SOURCE < 600
+#	define _XOPEN_SOURCE 600	// enable barriers
+#endif
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <errno.h>
+#include <stdbool.h>
+#include <string.h>
+#include <pthread.h>
+
+#define THREADS 2		// the number of threads for race condition testing
+#define ITERATIONS 1000000	// the number of operations
+
+volatile int count = 0;		// shared variable
+
+// declare and initialize a mutex (static initialization by a constant)
+pthread_mutex_t count_lock = PTHREAD_MUTEX_INITIALIZER;
+bool mutex_initialized = true;
+
+// a barrier declaration
+pthread_barrier_t sync_threads;
+bool barrier_initialized = false;
+
+// release all allocated resources, used in atexit(3)
+void release_resources(void)
+{       
+	if (mutex_initialized) {
+		// release system resources allocated by the mutex
+		if (pthread_mutex_destroy(&count_lock))
+			perror("pthread_mutex_destroy");
+		mutex_initialized = false;
+	}
+	if (barrier_initialized) {
+		// release system resources allocated by the barrier
+		if (pthread_barrier_destroy(&sync_threads))
+			perror("pthread_barrier_destroy");
+		barrier_initialized = false;
+	}
+}
+
+// synchronization by a barrier / synchronizace bariérou
+static void synchronize_threads(void)
+{
+	switch (pthread_barrier_wait(&sync_threads)) {	// wait at the barrier and check the return code
+		case PTHREAD_BARRIER_SERIAL_THREAD:
+			// this will be executed only once (by only one thread)
+			printf("The threads are synchronized.\n");
+			// we can also release shared resources that are not needed anymore (like the barrier itself)
+		case 0:	// this will be executed by all threads
+			break;
+		default:// error
+			perror("pthread_barrier_wait");
+			exit(EXIT_FAILURE);
+	}
+
+}
+
+void *ThreadAdd(void *arg)
+{
+	int i;
+	// register int reg;
+
+	synchronize_threads();		// synchronize threads start / synchronizace startu vláken
+
+	for (i = 0; i < ITERATIONS; i++) {
+		// ENTRY SECTION
+		pthread_mutex_lock(&count_lock);	// like semaphore wait
+		// return value is not checked, possible errors that shall not happen:
+		//	EINVAL (PTHREAD_PRIO_PROTECT used, thread's priority is higher)
+		//	EINVAL (not a valid mutex)
+		//	EAGAIN (recursive locks exceeded)
+		//	EDEADLK (current thread owns the mutex)
+		// CRITICAL SECTION
+		// Compilation of "count++" is platform (CPU) dependent because
+		// the CPU can store the value into register, increase that register
+		// and store the result back into the memory variable.
+		// We simulate this behavior by three commands and a local variable.
+		// The compiler is instructed to not optimize this code.
+		count++; // can be compiled using a CPU register:
+		// reg = count;		// save the global count locally
+		// reg = reg + 1;	// increment the local copy
+		// count = reg;		// store the local value into the global count
+		// EXIT SECTION
+		pthread_mutex_unlock(&count_lock);	// like semaphore signal
+		// return value is not checked, possible errors that shall not happen:
+		//	EINVAL (not a valid mutex)
+		//	EAGAIN (recursive locks exceeded)
+		//	EPERM (current thread does not own the mutex)
+	}
+	return NULL;
+}
+
+int main(int argc, char *argv[])
+{
+	pthread_t thread_ids[THREADS];
+	int i, rc;
+
+	atexit(release_resources);	// release resources at program exit
+
+	// an alternative initialization of the mutex during run-time
+	// if (pthread_mutex_init(&count_lock, NULL)) {
+	// 	perror("pthread_mutex_init");
+	// 	exit(EXIT_FAILURE);
+	// }
+	// mutex_initialized = true;
+
+	// initialize the barrier to the number of threads
+	if (pthread_barrier_init(&sync_threads, NULL, THREADS)) {
+		perror("pthread_barrier_init");
+		exit(EXIT_FAILURE);
+	}
+	barrier_initialized = true;
+
+	// create threads
+	for (i = 0; i < THREADS; ++i) {
+		if ((rc = pthread_create(&thread_ids[i], NULL, ThreadAdd, NULL))) {
+			fprintf(stderr, "pthread_create failed for the thread %d, %s\n", i, strerror(rc));
+			exit(EXIT_FAILURE);
+		}
+	}
+
+	// wait for all threads to terminate
+	for (i = 0; i < THREADS; ++i) {
+		(void) pthread_join(thread_ids[i], NULL);
+		// return value is not checked, possible errors that shall not happen:
+		//	EDEADLK	(no threads are trying to join with each other, not a calling thread id)
+		//	EINVAL (no thread is detached, no other thread is trying to join this one)
+		//	ESRCH (thread id is valid existing thread, checked by rc from pthread_create)
+	}
+
+	// resources are released using atexit(3)
+
+	// check the result
+	if (count < THREADS * ITERATIONS) {
+		fprintf(stderr, "BOOM! count = %d, should be %d\n", count, THREADS * ITERATIONS);
+		return EXIT_FAILURE;
+	}
+	else {
+		printf("OK! count = %d\n", count);
+		return EXIT_SUCCESS;
+	}
+}
+
+// EOF
