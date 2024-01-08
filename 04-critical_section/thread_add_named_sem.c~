@@ -1,0 +1,131 @@
+// Operating Systems: sample code  (c) Tomáš Hudec
+// Threads
+// Critical Sections
+// POSIX named semaphores:
+// sem_open(3), sem_wait(3), sem_post(3), sem_unlink(3), sem_close(3)
+//
+// Modified: 2015-11-11, 2016-11-21, 2021-04-14
+//
+#include <stdio.h>
+#include <stdlib.h>
+#include <errno.h>
+#include <pthread.h>
+#include <semaphore.h>		// POSIX semaphores
+#include <fcntl.h>		// open flags: O_CREAT
+#include <sys/stat.h>		// permissions: S_IRWXU
+
+#define SEM_NAME	"/thread_add-login"	// replace login with your real login name
+
+#define ITERATIONS	1000000	// the number of operations
+
+volatile int count = 0;		// shared variable
+
+time_t start_time;
+
+// declare a pointer to named semaphore
+sem_t *psem_count_lock;
+
+// simple (not guaranteed) synchronization:
+// wait for time change (a new second) -- at most one second
+// jednoduchá (nezaručená) synchronizace:
+// čeká na změny času (na novou sekundu) -- nejvýše jednu sekundu
+static void sync_threads(void)
+{
+	while (time(NULL) == start_time) {
+		// do nothing except chew CPU slices for up to one second
+		// nedělá nic než spotřebovává procesorový čas zjišťováním času
+	}
+}
+
+void *ThreadAdd(void *arg)
+{
+	int i
+	// register int reg;
+
+	sync_threads();		// synchronize threads start / synchronizace startu vláken
+
+	for (i = 0; i < ITERATIONS; ++i) {
+		// ENTRY SECTION
+		sem_wait(psem_count_lock);
+		// return value is not checked, possible errors that shall not happen:
+		//	EINVAL (not a valid semaphore)	-- psem_count_lock is valid and initialized
+		//	EINTR (interrupted by a signal handler)	-- signal handlers are not used,
+		//		SA_RESTART ensures that EINTR never happens (since Linux 2.6.22)
+		// CRITICAL SECTION
+		// Compilation of "count++" is platform (CPU) dependent because
+		// the CPU can store the value into register, increase that register
+		// and store the result back into the memory variable.
+		// We simulate this behavior by three commands and a local variable.
+		// The compiler is instructed to not optimize this code.
+		count++; // can be compiled using a CPU register:
+		// reg = count;		// save the global count locally
+		// reg = reg + 1;	// increment the local copy
+		// count = reg;		// store the local value into the global count
+		// EXIT SECTION
+		sem_post(psem_count_lock);
+		// return value is not checked, possible errors that shall not happen:
+		//	EINVAL (not a valid semaphore)	-- psem_count_lock is valid and initialized
+		//	EOVERFLOW	-- cannot happen, post is always called after wait
+	}
+	return NULL;
+}
+
+int main(int argc, char *argv[])
+{
+	pthread_t tid1, tid2;
+
+	start_time = time(NULL);
+
+	// initialize the semaphore counter to one
+	// parameters:
+	//   semaphore name,
+	//   flags: O_CREAT = create a new semaphore if this name does not exist,
+	//   mode: permissions,
+	//   counter value
+	if (SEM_FAILED == (psem_count_lock = sem_open(SEM_NAME, O_CREAT, S_IRWXU, 1))) {
+		perror("sem_open");
+		exit(EXIT_FAILURE);
+	}
+	// release the system resources of the semaphore after it is closed
+	if (sem_unlink(SEM_NAME)) {
+		perror("sem_unlink");
+		exit(EXIT_FAILURE);
+	}
+
+	// create two threads
+	if (pthread_create(&tid1, NULL, ThreadAdd, NULL)) {
+		fprintf(stderr, "ERROR creating thread 1\n");
+		return EXIT_FAILURE;
+	}
+	if (pthread_create(&tid2, NULL, ThreadAdd, NULL)) {
+		fprintf(stderr, "ERROR creating thread 2\n");
+		return EXIT_FAILURE;
+	}
+
+	// wait for the threads termination
+	if (pthread_join(tid1, NULL)) {
+		fprintf(stderr, "ERROR joining thread 1\n");
+		return EXIT_FAILURE;
+	}
+	if (pthread_join(tid2, NULL)) {
+		fprintf(stderr, "ERROR joining thread 2\n");
+		return EXIT_FAILURE;
+	}
+
+	// close the semaphore
+	if (sem_close(psem_count_lock)) {
+		perror("sem_close");
+		exit(EXIT_FAILURE);
+	}
+
+	// check the result
+	if (count < 2 * ITERATIONS) {
+		fprintf(stderr, "BOOM! count is %d, should be %d\n", count,
+			2 * ITERATIONS);
+		return EXIT_FAILURE;
+	}
+	else {
+		printf("OK! count is %d\n", count);
+		return EXIT_SUCCESS;
+	}
+}

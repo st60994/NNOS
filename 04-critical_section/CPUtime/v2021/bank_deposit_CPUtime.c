@@ -1,0 +1,363 @@
+// Operating Systems: sample code  (c) Tomáš Hudec
+// Threads
+// Critical Sections
+//
+// Example code that simulates several concurrent sequences of bank transactions.
+// The critical section is the money deposit.
+//
+// Vkládání peněz na bankovní účet několika vlákny současně.
+//
+// Modified: 2015-12-17, 2016-11-22, 2017-04-19, 2017-12-06, 2020-11-23
+
+#if !defined _XOPEN_SOURCE || _XOPEN_SOURCE < 600
+#	define _XOPEN_SOURCE 600	// portable usage of barriers
+#endif
+
+#include <pthread.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include <unistd.h>		// getopt
+#include <errno.h>
+#include <stdbool.h>
+#include <time.h>		// real time measuring
+#include <sys/time.h>		// CPU time measuring
+#include <sys/resource.h>	// CPU time measuring
+#include "cs_methods.h"		// methods for critical section access control
+
+#define MAX_THREADS			1024
+
+static bool sync_start = true;	// always synchronous start
+pthread_barrier_t barrier;
+bool barrier_initialized = false;
+
+int verbose = 1;		// 0 = quiet mode
+
+int cs_method = -1;		// a command-line option
+
+// default values
+#define ACCOUNT_START			    1
+#define BANK_TRANSACTION_AMOUNT		  101
+#define BANK_TRANSACTION_FEE		    1
+#define BANK_TRANSACTIONS_PER_THREAD	10000
+#define THREAD_COUNT			    3
+
+// initial account balance / stav účtu na začátku
+volatile long long int account_balance = ACCOUNT_START;
+
+// deposit value / částka pro vklad
+static long long int bank_transaction_amount = BANK_TRANSACTION_AMOUNT;
+
+// transaction fee / poplatek za převod
+static long long int bank_transaction_fee = BANK_TRANSACTION_FEE;
+
+// number of transactions per thread / počet transakcí na vlákno
+static unsigned int bank_transactions_per_thread = BANK_TRANSACTIONS_PER_THREAD;
+
+// number of threads / počet vláken
+static unsigned int thread_count = THREAD_COUNT;
+
+
+// structure array for threads / pole záznamů pro vlákna
+struct thread_info_t {
+	pthread_t id;
+	int arg;
+} thread_info[MAX_THREADS];
+
+// prototypes
+void eval_args(int argc, char *argv[]);
+
+struct timespec real_time1, real_time2;	// counting the real time
+struct rusage CPU_time1, CPU_time2;	// counting the CPU clocks
+double real_time;			// time spent executing the process
+double CPU_time_user, CPU_time_system;	// time spent on the CPU
+
+// release all allocated resources, used in atexit(3)
+void release_resources(void)
+{
+	if (barrier_initialized) {
+		// destroy the barrier
+		if (pthread_barrier_destroy(&barrier))
+			perror("pthread_barrier_destroy");
+		barrier_initialized = false;
+	}
+	// destroy resources used for the critical section access control
+	cs_destroy();
+}
+
+// bank transaction: log, calculate, return the new balance
+// bankovni operace: uložení záznamu, vyppočtení a vrácení nového stavu
+FORCE_INLINE
+long long int deposit_money(long long int value)
+{
+	// log the transaction / vytvoř záznam o operaci
+	if (verbose > 2)
+		printf("before: %lld, credit: %lld, fee: %lld\n", account_balance, value, bank_transaction_fee);
+	// do calcutation and return the new account balance
+	// provedení výpočtu a vrácení nového stavu účtu
+	return account_balance + value - bank_transaction_fee;
+}
+
+FORCE_INLINE
+void time_init(void)
+{
+	clock_gettime(CLOCK_MONOTONIC, &real_time1);	// real time init
+	getrusage(RUSAGE_SELF, &CPU_time1);		// initialize the CPU time
+}
+
+// thread function for transactions / vláknová funkce pro provádění transakcí
+// the argument is a pointer to the thread id
+void *bank_deposit(void *arg)
+{
+	#define	tid	(*(int *)arg)
+	int i;
+
+	if (sync_start)
+		// if requested, start synchronously
+		switch (pthread_barrier_wait(&barrier)) {
+		case PTHREAD_BARRIER_SERIAL_THREAD:
+			if (verbose)
+				printf("All the threads have started transactions.\n");
+			time_init();
+		case 0:
+			break;
+		default:
+			perror("pthread_barrier_wait");
+			exit(3);
+		}
+
+	if (verbose > 1)
+		printf("The thread %d has started transactions.\n", tid);
+
+	// perform several transactions per thread
+	for (i = 0; i < bank_transactions_per_thread; ++i) {
+
+		cs_enter(tid);	// critical section begin
+
+		// save the new account balance / ulož nový stav účtu
+		account_balance = deposit_money(bank_transaction_amount);
+
+		cs_leave(tid);	// critical section end
+	}
+
+	if (verbose > 1)
+		printf("The thread %d has finished transactions.\n", tid);
+
+	return NULL;
+	#undef tid
+}
+
+
+//
+// main / hlavní program
+//
+int main(int argc, char *argv[])
+{
+	int i;
+	long long int expected;	// očekavaný stav
+
+	// argument(s) evaluation / zpracování argumentů
+	eval_args(argc, argv);
+
+	if (cs_method < 0) {
+		fprintf(stderr, "No method specified.\n");
+		return 2;
+	}
+
+	// calculate the expected account balance after all transactions
+	// spočti očekávaný stav účtu po provedení všech tranaskcí
+	expected = account_balance +
+		thread_count * bank_transactions_per_thread *
+			(bank_transaction_amount - bank_transaction_fee);
+
+	if (verbose)
+		printf("Balance before: %10lld\n", account_balance);
+
+	// release used resources automatically upon exit
+	atexit(release_resources);
+
+	// init for the critical section access control; failure to init = exit
+	// inicializace pro ošetření kritické sekce
+	cs_init(cs_method, thread_count);
+
+	// barrier initialization
+	if (sync_start) {
+		if (pthread_barrier_init(&barrier, NULL, thread_count)) {
+			perror("pthread_barrier_init");
+			return 3;
+		}
+		barrier_initialized = true;
+	}
+	else
+		time_init();
+
+	// start several threads performing transactions
+	for (i = 0; i < thread_count; ++i) {
+		thread_info[i].arg = i;
+		// run a new transaction thread
+		if (pthread_create(&thread_info[i].id, NULL, bank_deposit, &thread_info[i].arg)) {
+			// failed to create a thread
+			perror("pthread_create");
+			return 3;
+		}
+	}
+
+	// wait for threads to finish / čekej na dokončení vláken
+	for (i = 0; i < thread_count; ++i) {
+		// correct usage of threads: no error can occur
+		pthread_join(thread_info[i].id, NULL);
+	}
+
+	// calculate the CPU and real time used by threads
+	getrusage(RUSAGE_SELF, &CPU_time2);
+	clock_gettime(CLOCK_MONOTONIC, &real_time2);
+
+	// substract init time, merge the values (seconds and microseconds)
+	real_time = (double) (real_time2.tv_sec - real_time1.tv_sec) + (double) (real_time2.tv_nsec - real_time1.tv_nsec) / 1000000000.0;
+	CPU_time_user =
+	    (double) (CPU_time2.ru_utime.tv_sec - CPU_time1.ru_utime.tv_sec) + (double) (CPU_time2.ru_utime.tv_usec - CPU_time1.ru_utime.tv_usec) / 1000000.0;
+	CPU_time_system =
+	    (double) (CPU_time2.ru_stime.tv_sec - CPU_time1.ru_stime.tv_sec) + (double) (CPU_time2.ru_stime.tv_usec - CPU_time1.ru_stime.tv_usec) / 1000000.0;
+
+	// print the used time
+	printf("The time spent on the CPU(s) in milliseconds (real user system): "
+	       "%.0lf %.0lf %.0lf\n", real_time * 1000, CPU_time_user * 1000, CPU_time_system * 1000);
+
+	if (verbose)
+		printf("Balance after:  %10lld\n", account_balance);
+
+	// compare the result with expected value / porovnej výsledek s očekávanou hodnotou
+	if (account_balance != expected) {
+		fprintf(stderr, "ERROR IN TRANSACTIONS! Balance: %lld, expected: %lld\n", account_balance, expected);
+		return EXIT_FAILURE;
+	}
+
+	return EXIT_SUCCESS;
+}
+
+
+//
+// usage
+//
+void usage(FILE * stream, char *self)
+{
+	fprintf(stream,
+		"Usage:\n"
+		"  %s -h\n"
+		"  %s [-q|-v] -m method [-y] [-c threads] [-t tansactions] [-a amount] [-s init_state]\n"
+		"Purpose:\n"
+		"  Simulation of concurrent bank transactions.\n"
+		"Options:\n"
+		"  -h		help\n"
+		"  -m method	the method used for critical section access control (see below)\n"
+		"  -y 		use sched_yield(2) during busy wait (default no)\n"
+		"  -c count	the number of concurrent threads (%u, max. %d)\n"
+		"  -t count	the number of transactions per one thread (%u)\n"
+		"  -a amount	the transaction deposit value (%lld)\n"
+		"  -f amount	the transaction fee (%lld)\n"
+		"  -s state	the initial account balance (%lld)\n"
+		"  -q		do not print account balance state\n"
+		"  -v		print more verbose information\n"
+		"Methods available:\n"
+		"  %2d		SW with the locked variable\n"
+		"  %2d		Peterson's SW\n"
+		"  %2d		Peterson's HW (with the xchg instruction)\n"
+		"  %2d		HW with the xchg instruction\n"
+		"  %2d		HW with SW test and the xchg instruction\n"
+		"  %2d		POSIX mutex\n"
+		"  %2d		POSIX unnamed semaphore\n"
+		"  %2d		POSIX named semaphore\n"
+		"  %2d		System V semaphore\n"
+		"  %2d		POSIX message queue\n"
+		"  %2d		System V message queue\n"
+		, self, self
+		, thread_count, MAX_THREADS
+		, bank_transactions_per_thread
+		, bank_transaction_amount
+		, bank_transaction_fee
+		, account_balance
+		, CS_METHOD_LOCKED
+		, CS_METHOD_PETERSON
+		, CS_METHOD_PETERSON_XCHG
+		, CS_METHOD_XCHG
+		, CS_METHOD_TEST_XCHG
+		, CS_METHOD_MUTEX
+		, CS_METHOD_SEM_POSIX
+		, CS_METHOD_SEM_POSIX_NAMED
+		, CS_METHOD_SEM_SYSV
+		, CS_METHOD_MQ_POSIX
+		, CS_METHOD_MQ_SYSV
+		);
+}
+
+
+//
+// arguments and switches evaluation / vyhodnocení přepínačů z příkazové řádky
+//
+void eval_args(int argc, char *argv[])
+{
+	int opt;		// option
+
+	opterr = 0;		// do not print errors, we'll print it
+	// switches processing
+	while (-1 != (opt = getopt(argc, argv, "hwqvc:t:a:f:s:m:y"))) {
+		switch (opt) {
+		// -c thread_count
+		case 'c':
+			thread_count = atoi(optarg);
+			if (thread_count < 1 || thread_count > MAX_THREADS) {
+				fprintf(stderr, "The number of threads is limited to 1 to %d\n", MAX_THREADS);
+				exit(2);
+			}
+			break;
+		// -t transactions_per_thread
+		case 't':
+			bank_transactions_per_thread = atoi(optarg);
+			break;
+		// -a transaction_amount
+		case 'a':
+			bank_transaction_amount = atoll(optarg);
+			break;
+		// -f transaction_fee
+		case 'f':
+			bank_transaction_fee = atoll(optarg);
+			break;
+		// -s initial_account_balance
+		case 's':
+			account_balance = atoll(optarg);
+			break;
+		// quiet
+		case 'q':
+			verbose = 0;
+			break;
+		// more verbose
+		case 'v':
+			verbose++;
+			break;
+		// wait for synchronous start
+		case 'w':
+			sync_start = true;
+			break;
+		// -m method
+		case 'm':
+			cs_method = atoll(optarg);
+			break;
+		// use sched_yield(2) during busy waits
+		case 'y':
+			busy_wait_yields = true;
+			break;
+		// help
+		case 'h':
+			usage(stdout, argv[0]);
+			exit(EXIT_SUCCESS);
+			break;
+		// unknown option
+		default:
+			fprintf(stderr, "%c: unknown option.\n", optopt);
+			usage(stderr, argv[0]);
+			exit(2);
+			break;
+		}
+	}
+}
+
+// EOF
