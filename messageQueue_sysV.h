@@ -23,21 +23,11 @@
 #include <stdlib.h>						// exit
 #include <stdio.h>						// fprintf
 // additional includes for critical section access control methods
-#include <sys/msg.h>					// SysV message queue
-#include <sys/ipc.h>					// IPC_PRIVATE
-#include <errno.h>						// errno
 
 
 bool busy_wait_yields = false;			// set by the main program
 
 // macros, variable declarations and function definitions for critical section access control
-int mq_sysv;			// variable for SysV message queue identifier
-
-struct msgbuf {			// struct message buffer for message params
-	long int msg_type;
-};
-
-struct msgbuf msg_buf_sysv;			// message buffer
 
 
 // note: inline is not used unless asked for optimization
@@ -90,20 +80,6 @@ void cs_init(int method)
 	case CS_METHOD_MQ_POSIX:
 		break;
 	case CS_METHOD_MQ_SYSV:
-		msg_buf_sysv.msg_type = 1;
-		if ((mq_sysv = msgget(IPC_PRIVATE, 0600)) == -1) {			// gets message queue identifier
-																	// IPC_PRIVATE to create mq belonging to the process
-																	// 0600 adds read and write permissions only to owner
-			perror("msgget");
-			exit(EXIT_FAILURE);
-		}
-		if ((msgsnd(mq_sysv, (void*) &msg_buf_sysv,0,0) == -1)) {			// sends innitial message to queue
-																			// msg_buf_sysv contains message params
-																			// message size is 0
-																			// we do not use any flags, so 0
-			perror("innit_msgsnd");
-			exit(EXIT_FAILURE);
-		}
 		break;
 	default:
 		fprintf(stderr, "Error: The method %d is not defined.\n", cs_method_used);
@@ -134,14 +110,6 @@ void cs_destroy(void)
 	case CS_METHOD_MQ_POSIX:
 		break;
 	case CS_METHOD_MQ_SYSV:
-		if (msgctl(mq_sysv, IPC_RMID, NULL) == -1) {			// remove the message queue
-																// IPC_RMID flag to remove the message queue
-																// NULL because we do not pass any msqid_ds struct 
-			perror("msgctl_destroy");
-		}
-		else {
-			cs_var_allocated = false;
-		}
 		break;
 	}
 }
@@ -169,14 +137,6 @@ void cs_enter(int id)
 	case CS_METHOD_MQ_POSIX:
 		break;
 	case CS_METHOD_MQ_SYSV:
-		if (msgrcv(mq_sysv, (void*) &msg_buf_sysv, 0, 0, 0) == -1) {			// receive message from queue
-																				// we can use same msg_buf_sysv because content of all messages is the same
-																				// message size is 0 because we send them with size 0
-																				// message type is 0 to take out first message in queue
-																				// message flags are 0 because we do not use flags
-			perror("msgrcv");
-			exit(EXIT_FAILURE);
-		}
 		break;
 	}
 }
@@ -204,13 +164,6 @@ void cs_leave(int id)
 	case CS_METHOD_MQ_POSIX:
 		break;
 	case CS_METHOD_MQ_SYSV:
-		if ((msgsnd(mq_sysv, (void*) &msg_buf_sysv, 0, 0) == -1)) {			// sends message to queue
-																			// msg_buf_sysv contains message params
-																			// message size is 0
-																			// we do not use any flags, so 0
-			perror("msgsnd");
-				exit(EXIT_FAILURE);
-		}
 		break;
 	}
 }
